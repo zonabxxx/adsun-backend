@@ -33,7 +33,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Apply middleware
 app.use(cors({
   // CORS configuration with increased header size
-  origin: process.env.FRONTEND_URL || ['http://localhost:3002', 'https://www.edon.sk', 'http://www.edon.sk'],
+  origin: ['http://localhost:3002', 'https://www.edon.sk', 'http://www.edon.sk', 'https://edon.sk', 'http://edon.sk'],
   credentials: true,
   maxAge: 86400, // 24 hours in seconds
   exposedHeaders: ['Content-Length', 'X-Content-Type-Options'],
