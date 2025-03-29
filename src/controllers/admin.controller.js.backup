@@ -1,0 +1,1396 @@
+const User = require('../models/user.model');
+const Role = require('../models/role.model');
+const logger = require('../utils/logger');
+const PermissionTemplate = require('../models/permissionTemplate.model');
+
+/**
+ * Mapuje hodnoty roleName na skutočné názvy rolí v databáze (ak existuje mapovanie)
+ * @param {String} roleName - Názov role, ktorý sa má mapovať
+ * @returns {String} - Skutočný názov role v databáze alebo neupravený vstupný názov
+ */
+const mapRoleNameToDbName = (roleName) => {
+  // Základné mapovanie pre spätnú kompatibilitu
+  const roleMap = {
+    'admin': 'admin',
+    'manager': 'manager',
+    'user': 'user',
+    'accountant': 'accountant',
+    'employee': 'employee'
+  };
+  
+  // Ak existuje mapovanie, použijeme ho, inak vrátíme pôvodný názov
+  return roleMap[roleName] || roleName;
+};
+
+/**
+ * Mapuje skutočné názvy rolí v databáze na hodnoty roleName (ak existuje mapovanie)
+ * @param {String} dbRoleName - Skutočný názov role v databáze
+ * @returns {String} - Namapovaná hodnota alebo neupravený vstupný názov
+ */
+const mapDbNameToRoleName = (dbRoleName) => {
+  // Základné mapovanie pre spätnú kompatibilitu
+  const roleMap = {
+    'admin': 'admin',
+    'manager': 'manager',
+    'user': 'user',
+    'accountant': 'accountant', 
+    'employee': 'employee'
+  };
+  
+  // Ak existuje mapovanie, použijeme ho, inak vrátíme pôvodný názov
+  return roleMap[dbRoleName] || dbRoleName;
+};
+
+/**
+ * Získanie zoznamu všetkých používateľov
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.getUsers = async (req, res) => {
+  try {
+    const users = await User.find({})
+      .select('-passwordHash');
+    
+    // Transformácia dát pre jednotný formát
+    const formattedUsers = users.map(user => ({
+      id: user._id,
+      username: user.username,
+      email: user.email,
+      role: user.roleName || 'Používateľ',
+      active: user.isActive || false,
+      lastLogin: user.lastLogin
+    }));
+    
+    res.status(200).json({
+      success: true,
+      users: formattedUsers
+    });
+  } catch (error) {
+    logger.error(`Error getting users: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri získavaní používateľov',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Získanie detailu používateľa podľa ID
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.getUserById = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+      .select('-passwordHash');
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Používateľ nenájdený'
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        firstName: user.firstName || '',
+        lastName: user.lastName || '',
+        fullName: user.fullName || '',
+        role: user.roleName || 'Používateľ',
+        roleName: user.roleName || 'Používateľ',
+        roleId: user.roleId,
+        permissions: user.permissions || {},
+        active: user.isActive || false,
+        lastLogin: user.lastLogin
+      }
+    });
+  } catch (error) {
+    logger.error(`Error getting user by ID: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri získavaní používateľa',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Vytvorenie nového používateľa
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.createUser = async (req, res) => {
+  try {
+    const { username, email, password, firstName, lastName, roleName, isActive } = req.body;
+    
+    // Logovanie vstupných dát
+    logger.info(`Vytváram používateľa: ${username}, email: ${email}, roleName: ${roleName || 'neurčená'}`);
+    
+    // Kontrola existencie používateľského mena alebo emailu
+    const existingUser = await User.findOne({
+      $or: [{ username }, { email }]
+    });
+    
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        message: 'Používateľské meno alebo email už existuje'
+      });
+    }
+    
+    // Základné oprávnenia pre dashboard - použijeme len ak sa nenájde rola
+    let permissions = {
+      dashboard: {
+        read: true,
+        statistics: {
+          read: true
+        }
+      }
+    };
+    
+    let selectedRoleName = 'user'; // Predvolená hodnota
+    let roleId = null;
+
+    // Ak je zadaná rola, pokúsime sa ju nájsť v databáze
+    if (roleName) {
+      // Mapujeme názov role (ak je potrebné mapovanie)
+      const dbRoleName = mapRoleNameToDbName(roleName);
+      logger.info(`Hľadám rolu s názvom ${dbRoleName} (mapované z ${roleName})`);
+      
+      const role = await Role.findOne({ name: dbRoleName });
+      if (role) {
+        roleId = role._id;
+        selectedRoleName = roleName; // Použijeme originálny roleName od používateľa
+        logger.info(`Priradenie role ${dbRoleName} (${role._id}) novému používateľovi ${username}`);
+        
+        // Použijeme oprávnenia z role - najprv skontrolujeme, či má rola defaultPermissions
+        const rolePermissions = role._doc.defaultPermissions || role.permissions;
+        if (rolePermissions && Object.keys(rolePermissions).length > 0) {
+          permissions = rolePermissions;
+          logger.info(`Použitie oprávnení z role ${dbRoleName} pre používateľa ${username}`);
+        } else {
+          logger.info(`Rola ${dbRoleName} nemá definované oprávnenia v databáze, používam základné oprávnenia pre dashboard`);
+        }
+      } else {
+        logger.warn(`Rola s názvom ${dbRoleName} nebola nájdená v databáze, použijem predvolenú rolu 'user'`);
+      }
+    } else {
+      logger.info('Rola nebola zadaná, použijem predvolenú rolu "user"');
+    }
+    
+    // Vytvorenie nového používateľa s oprávneniami
+    const newUser = new User({
+      username,
+      email,
+      password,
+      firstName: firstName || '',
+      lastName: lastName || '',
+      roleName: selectedRoleName,
+      roleId: roleId,
+      permissions: permissions,
+      isActive: isActive === undefined ? true : isActive
+    });
+    
+    // Logovanie vytváraného používateľa
+    logger.info(`Ukladám nového používateľa s roleName: ${selectedRoleName}, roleId: ${roleId || 'null'}`);
+    logger.info(`Permissions pre nového používateľa: ${JSON.stringify(permissions)}`);
+    
+    await newUser.save();
+    
+    res.status(201).json({
+      success: true,
+      message: 'Používateľ bol úspešne vytvorený',
+      user: {
+        id: newUser._id,
+        username: newUser.username,
+        email: newUser.email,
+        role: newUser.roleName,
+        active: newUser.isActive,
+        permissions: newUser.permissions
+      }
+    });
+  } catch (error) {
+    logger.error(`Error creating user: ${error.message}`);
+    logger.error(`Stack trace: ${error.stack}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri vytváraní používateľa',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Aktualizácia používateľa podľa ID
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.updateUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { username, email, firstName, lastName, roleName, isActive } = req.body;
+    
+    logger.info(`Aktualizujem používateľa s ID: ${id}`);
+    logger.info(`Príchodzie dáta: ${JSON.stringify(req.body)}`);
+    
+    // Hľadáme používateľa v databáze
+    const user = await User.findById(id);
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Používateľ nebol nájdený'
+      });
+    }
+    
+    // Kontrola duplicitného používateľského mena alebo emailu
+    if (username !== user.username || email !== user.email) {
+      const existingUser = await User.findOne({
+        _id: { $ne: id },
+        $or: [
+          { username: username || user.username },
+          { email: email || user.email }
+        ]
+      });
+      
+      if (existingUser) {
+        return res.status(400).json({
+          success: false,
+          message: 'Používateľské meno alebo email už používa iný používateľ'
+        });
+      }
+    }
+    
+    // Aktualizácia základných údajov používateľa
+    user.username = username || user.username;
+    user.email = email || user.email;
+    user.firstName = firstName !== undefined ? firstName : user.firstName;
+    user.lastName = lastName !== undefined ? lastName : user.lastName;
+    user.isActive = isActive !== undefined ? isActive : user.isActive;
+    
+    let roleUpdated = false;
+    let permissions = user.permissions;
+    
+    // Aktualizácia role ak bola zadaná
+    if (roleName && roleName !== user.roleName) {
+      logger.info(`Zmena role používateľa ${user.username} z ${user.roleName} na ${roleName}`);
+      
+      // Mapujeme názov role (ak je potrebné mapovanie)
+      const dbRoleName = mapRoleNameToDbName(roleName);
+      logger.info(`Hľadám rolu s názvom ${dbRoleName} (mapované z ${roleName})`);
+      
+      const role = await Role.findOne({ name: dbRoleName });
+      if (role) {
+        user.roleId = role._id;
+        user.roleName = roleName; // Použijeme originálny roleName od používateľa
+        roleUpdated = true;
+        
+        logger.info(`Priradenie novej role ${dbRoleName} (${role._id}) používateľovi ${user.username}`);
+        
+        // Použijeme oprávnenia z role, ak existujú
+        const rolePermissions = role._doc.defaultPermissions || role.permissions;
+        if (rolePermissions && Object.keys(rolePermissions).length > 0) {
+          permissions = rolePermissions;
+          user.permissions = permissions;
+          logger.info(`Aktualizácia oprávnení z novej role ${dbRoleName} pre používateľa ${user.username}`);
+        } else {
+          logger.info(`Rola ${dbRoleName} nemá definované oprávnenia, ponechávam existujúce oprávnenia pre používateľa ${user.username}`);
+        }
+      } else {
+        logger.warn(`Rola s názvom ${dbRoleName} nebola nájdená v databáze, ponechávam pôvodnú rolu ${user.roleName}`);
+      }
+    } else {
+      logger.info(`Rola používateľa ${user.username} zostáva nezmenená (${user.roleName})`);
+    }
+    
+    await user.save();
+    
+    res.status(200).json({
+      success: true,
+      message: 'Používateľ bol úspešne aktualizovaný',
+      roleUpdated,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.roleName,
+        permissions: user.permissions,
+        active: user.isActive
+      }
+    });
+  } catch (error) {
+    logger.error(`Error updating user: ${error.message}`);
+    logger.error(`Stack trace: ${error.stack}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri aktualizácii používateľa',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Aktualizácia stavu používateľa (aktívny/neaktívny)
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.updateUserStatus = async (req, res) => {
+  try {
+    const { active } = req.body;
+    
+    if (active === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'Chýba parameter aktívny/neaktívny'
+      });
+    }
+    
+    const user = await User.findById(req.params.id);
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Používateľ nenájdený'
+      });
+    }
+    
+    user.isActive = active;
+    await user.save();
+    
+    res.status(200).json({
+      success: true,
+      message: `Používateľ bol ${active ? 'aktivovaný' : 'deaktivovaný'}`,
+      user: {
+        id: user._id,
+        active: user.isActive
+      }
+    });
+  } catch (error) {
+    logger.error(`Error updating user status: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri aktualizácii stavu používateľa',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Vymazanie používateľa
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.deleteUser = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Používateľ nenájdený'
+      });
+    }
+    
+    await User.findByIdAndDelete(req.params.id);
+    
+    res.status(200).json({
+      success: true,
+      message: 'Používateľ bol úspešne vymazaný'
+    });
+  } catch (error) {
+    logger.error(`Error deleting user: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri vymazávaní používateľa',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Získanie zoznamu všetkých rolí
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.getRoles = async (req, res) => {
+  try {
+    // Získanie všetkých rolí
+    const roles = await Role.find({}).sort({ name: 1 });
+    
+    console.log(`[DEBUG] Počet nájdených rolí: ${roles.length}`);
+    
+    // Detailné logovanie rolí
+    roles.forEach((role, index) => {
+      console.log(`[DEBUG] Rola ${index + 1}: ID=${role._id}, name=${role.name}, isSystem=${role.isSystem || false}`);
+      
+      // Skontrolujeme, či má rola definované oprávnenia
+      const permissions = role.defaultPermissions || {};
+      console.log(`[DEBUG] Rola ${index + 1} permissions (skrátené):`, 
+        Object.keys(permissions).length === 0 ? 
+        "{}" : 
+        JSON.stringify(permissions).substring(0, 100) + '...');
+    });
+    
+    // Transformácia dát pre jednotný formát
+    const formattedRoles = roles.map(role => {
+      // Získame permissions z defaultPermissions
+      let permissions = role.defaultPermissions || {};
+      
+      // Ak permissions je prázdny objekt, inicializujeme základné oprávnenia podľa názvu role
+      if (Object.keys(permissions).length === 0) {
+        console.log(`[DEBUG] Inicializujem základné oprávnenia pre rolu: ${role.name}`);
+        permissions = initializeDefaultPermissions(role.name);
+        console.log(`[DEBUG] Vytvorené základné oprávnenia pre rolu ${role.name}:`, 
+          JSON.stringify(permissions).substring(0, 100) + '...');
+        
+        // Uložíme aktualizovanú rolu s oprávneniami pre budúce použitie
+        role.defaultPermissions = permissions;
+        
+        // Uložíme zmeny do databázy asynchrónne (nevyžadujeme čakanie na uloženie)
+        role.save().catch(err => {
+          console.error(`[DEBUG] Chyba pri ukladaní základných oprávnení pre rolu ${role.name}:`, err);
+        });
+      }
+      
+      return {
+        id: role._id,
+        name: role.name,
+        description: role.description || '',
+        permissions: permissions, // Vraciam permissions ako kópiu defaultPermissions pre kompatibilitu
+        defaultPermissions: permissions,
+        isSystem: role.isSystem || false,
+        createdAt: role.createdAt,
+        updatedAt: role.updatedAt,
+      };
+    });
+    
+    console.log('[DEBUG] Odosielam formátované role:');
+    formattedRoles.forEach((role, index) => {
+      console.log(`[DEBUG] Formátovaná rola ${index + 1}: id=${role.id}, name=${role.name}`);
+    });
+    
+    res.status(200).json({
+      success: true,
+      roles: formattedRoles
+    });
+  } catch (error) {
+    logger.error(`Error getting roles: ${error.message}`);
+    console.error('[DEBUG] Chyba pri získavaní rolí:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri získavaní rolí',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Inicializácia základných oprávnení podľa názvu role
+ * @param {String} roleName - Názov role
+ * @returns {Object} - Objekt s inicializovanými oprávneniami
+ */
+const initializeDefaultPermissions = (roleName) => {
+  console.log(`[DEBUG] Inicializujem základné oprávnenia pre rolu: ${roleName}`);
+  
+  // Základné oprávnenia pre dashboard (aby každá rola mala aspoň prístup na dashboard)
+  const permissions = {
+    dashboard: {
+      read: true,
+      statistics: {
+        read: true
+      }
+    }
+  };
+  
+  // Pridáme oprávnenia podľa názvu role
+  const roleNameLower = roleName.toLowerCase();
+  
+  // Administrátorske oprávnenia
+  if (roleNameLower === 'administrator' || roleNameLower === 'admin') {
+    permissions.admin = {
+      read: true,
+      write: true,
+      users: {
+        read: true,
+        write: true,
+        delete: true
+      },
+      roles: {
+        read: true,
+        write: true,
+        delete: true
+      },
+      settings: {
+        read: true,
+        write: true
+      },
+      logs: {
+        read: true
+      },
+      backups: {
+        read: true,
+        write: true,
+        execute: true
+      }
+    };
+    permissions.zakazky = {
+      read: true,
+      write: true,
+      delete: true,
+      create: {
+        read: true,
+        write: true
+      },
+      edit: {
+        read: true,
+        write: true,
+        delete: true
+      },
+      management: {
+        read: true,
+        write: true,
+        delete: true,
+        approve: true
+      }
+    };
+    permissions.vyroba = {
+      read: true,
+      write: true,
+      delete: true,
+      sklad: {
+        read: true,
+        write: true,
+        delete: true
+      },
+      planovanie: {
+        read: true,
+        write: true
+      },
+      vyrobky: {
+        read: true,
+        write: true,
+        delete: true
+      }
+    };
+    permissions.financie = {
+      read: true,
+      write: true,
+      delete: true,
+      faktury: {
+        read: true,
+        write: true,
+        delete: true,
+        approve: true
+      },
+      prijmy: {
+        read: true,
+        write: true,
+        delete: true
+      },
+      vydavky: {
+        read: true,
+        write: true,
+        delete: true
+      },
+      mzdy: {
+        read: true,
+        write: true,
+        approve: true
+      }
+    };
+  } 
+  // Manažérske oprávnenia
+  else if (roleNameLower === 'manažér' || roleNameLower === 'manager') {
+    permissions.admin = {
+      read: true,
+      users: {
+        read: true
+      },
+      roles: {
+        read: true
+      }
+    };
+    permissions.zakazky = {
+      read: true,
+      write: true,
+      create: {
+        read: true,
+        write: true
+      },
+      edit: {
+        read: true,
+        write: true
+      },
+      management: {
+        read: true,
+        write: true,
+        approve: true
+      }
+    };
+    permissions.vyroba = {
+      read: true,
+      write: true,
+      sklad: {
+        read: true
+      },
+      planovanie: {
+        read: true,
+        write: true
+      }
+    };
+    permissions.financie = {
+      read: true,
+      faktury: {
+        read: true,
+        approve: true
+      }
+    };
+  }
+  // Účtovnícke oprávnenia
+  else if (roleNameLower === 'účtovník' || roleNameLower === 'accountant') {
+    permissions.financie = {
+      read: true,
+      write: true,
+      faktury: {
+        read: true,
+        write: true,
+        approve: true
+      },
+      prijmy: {
+        read: true,
+        write: true
+      },
+      vydavky: {
+        read: true,
+        write: true
+      },
+      mzdy: {
+        read: true,
+        write: true
+      }
+    };
+    permissions.zakazky = {
+      read: true
+    };
+  }
+  // Zamestnanecké oprávnenia
+  else if (roleNameLower === 'employee' || roleNameLower === 'zamestnanec') {
+    permissions.zakazky = {
+      read: true
+    };
+    permissions.vyroba = {
+      read: true,
+      sklad: {
+        read: true
+      }
+    };
+  }
+  
+  console.log(`[DEBUG] Vytvorené základné oprávnenia pre rolu ${roleName}:`, JSON.stringify(permissions).substring(0, 100) + '...');
+  
+  return permissions;
+};
+
+/**
+ * Získanie detailu role podľa ID
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.getRoleById = async (req, res) => {
+  try {
+    console.log(`[DEBUG] Hľadám rolu s ID: ${req.params.id}`);
+    const role = await Role.findById(req.params.id);
+    
+    if (!role) {
+      console.log(`[DEBUG] Rola s ID ${req.params.id} nebola nájdená`);
+      return res.status(404).json({
+        success: false,
+        message: 'Rola nenájdená'
+      });
+    }
+    
+    console.log(`[DEBUG] Našla sa rola: ID=${role._id}, name=${role.name}`);
+    
+    // Získame permissions z defaultPermissions
+    let permissions = role.defaultPermissions || {};
+    console.log(`[DEBUG] Existujúce permissions pre rolu ${role.name}:`, 
+      Object.keys(permissions).length === 0 ? 
+      "{}" : 
+      JSON.stringify(permissions).substring(0, 200));
+    
+    // Ak permissions je prázdny objekt, inicializujeme základné oprávnenia
+    if (Object.keys(permissions).length === 0) {
+      console.log(`[DEBUG] Inicializujem základné oprávnenia pre rolu ${role.name}`);
+      permissions = initializeDefaultPermissions(role.name);
+      console.log(`[DEBUG] Vytvorené základné oprávnenia:`, 
+        JSON.stringify(permissions).substring(0, 200));
+      
+      // Uložíme aktualizovanú rolu s oprávneniami
+      role.defaultPermissions = permissions;
+      
+      await role.save();
+      console.log(`[DEBUG] Uložené základné oprávnenia pre rolu ${role.name}`);
+    }
+    
+    res.status(200).json({
+      success: true,
+      role: {
+        id: role._id,
+        name: role.name,
+        description: role.description || '',
+        permissions: permissions, // Vraciam permissions ako kópiu defaultPermissions pre kompatibilitu  
+        defaultPermissions: permissions,
+        isSystem: role.isSystem || false,
+        createdAt: role.createdAt,
+        updatedAt: role.updatedAt
+      }
+    });
+  } catch (error) {
+    logger.error(`Error getting role by ID: ${error.message}`);
+    console.error(`[DEBUG] Chyba pri získavaní role podľa ID ${req.params.id}:`, error);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri získavaní role',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Vytvorenie novej role
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.createRole = async (req, res) => {
+  try {
+    const { name, description, permissions, defaultPermissions } = req.body;
+    
+    // Logovanie pre debug
+    console.log('[DEBUG] Dáta pre vytvorenie role:', JSON.stringify({
+      name,
+      description,
+      permissionsType: permissions ? typeof permissions : null,
+      permissionsIsArray: permissions ? Array.isArray(permissions) : null,
+      permissionsKeys: permissions && typeof permissions === 'object' && !Array.isArray(permissions) ? Object.keys(permissions) : null
+    }));
+    
+    // Kontrola existencie názvu role
+    const existingRole = await Role.findOne({ name });
+    
+    if (existingRole) {
+      return res.status(400).json({
+        success: false,
+        message: 'Rola s týmto názvom už existuje'
+      });
+    }
+    
+    // Inicializácia oprávnení - preferujeme permissions pred defaultPermissions
+    let rolePermissions = {};
+    
+    // Detailné logovanie prijatých dát
+    if (permissions) {
+      console.log('[DEBUG] Permissions typ:', typeof permissions);
+      console.log('[DEBUG] Permissions je pole?', Array.isArray(permissions));
+      if (typeof permissions === 'object') {
+        if (Array.isArray(permissions)) {
+          console.log('[DEBUG] Permissions ako pole obsahuje:', permissions);
+        } else {
+          console.log('[DEBUG] Permissions ako objekt má kľúče:', Object.keys(permissions));
+          
+          // Kontrola náhodnej vzorky hodnôt
+          const sampleKeys = Object.keys(permissions).slice(0, 2);
+          sampleKeys.forEach(key => {
+            console.log(`[DEBUG] Permissions[${key}] typ:`, typeof permissions[key]);
+            console.log(`[DEBUG] Permissions[${key}] hodnota:`, JSON.stringify(permissions[key]).substring(0, 50));
+          });
+        }
+      }
+    }
+    
+    // Ak permissions je objekt s hierarchickou štruktúrou
+    if (permissions && typeof permissions === 'object' && !Array.isArray(permissions)) {
+      rolePermissions = JSON.parse(JSON.stringify(permissions)); // Vytvorenie hlbokej kópie
+      console.log('[DEBUG] Použité permissions z requestu - objekt');
+      
+      // Iterujeme cez všetky kategórie a odstránime vlastnosti z MongoDB
+      Object.keys(rolePermissions).forEach(categoryKey => {
+        const category = rolePermissions[categoryKey];
+        
+        // Ak je kategória objekt, odstránime MongoDB vlastnosti
+        if (category && typeof category === 'object') {
+          if ('_id' in category) delete category._id;
+          if ('__v' in category) delete category.__v;
+          if ('createdAt' in category) delete category.createdAt;
+          if ('updatedAt' in category) delete category.updatedAt;
+          
+          // Iterujeme cez všetky vlastnosti kategórie
+          Object.keys(category).forEach(propKey => {
+            const prop = category[propKey];
+            
+            // Ak je vlastnosť kategórie objekt (podkategória), odstránime MongoDB vlastnosti
+            if (prop && typeof prop === 'object' && !Array.isArray(prop)) {
+              if ('_id' in prop) delete prop._id;
+              if ('__v' in prop) delete prop.__v;
+              if ('createdAt' in prop) delete prop.createdAt;
+              if ('updatedAt' in prop) delete prop.updatedAt;
+            }
+          });
+        }
+      });
+    } 
+    // Ak defaultPermissions je objekt s hierarchickou štruktúrou
+    else if (defaultPermissions && typeof defaultPermissions === 'object' && !Array.isArray(defaultPermissions)) {
+      rolePermissions = JSON.parse(JSON.stringify(defaultPermissions)); // Vytvorenie hlbokej kópie
+      console.log('[DEBUG] Použité defaultPermissions z requestu - objekt');
+    }
+    // Ak permissions je pole stringov (z predchádzajúcej implementácie)
+    else if (Array.isArray(permissions) && permissions.length > 0) {
+      console.log('[DEBUG] Permissions je pole stringov, prekonvertujem na objekt:', permissions);
+      
+      // Vytvoríme základné štruktúry pre každú kategóriu
+      permissions.forEach(categoryId => {
+        if (typeof categoryId === 'string') {
+          rolePermissions[categoryId] = {
+            read: true,
+            write: false
+          };
+          console.log(`[DEBUG] Vytvorená štruktúra pre kategóriu ${categoryId}`);
+        }
+      });
+    }
+    // Ak permissions a defaultPermissions nie sú platné, použijeme defaultné oprávnenia
+    else {
+      console.log('[DEBUG] Pre rolu neboli poskytnuté žiadne oprávnenia, použijem základné');
+      rolePermissions = initializeDefaultPermissions(name);
+    }
+    
+    // Uistíme sa, že štruktúra pre uloženie je validná
+    if (!rolePermissions || typeof rolePermissions !== 'object' || Array.isArray(rolePermissions)) {
+      console.log('[DEBUG] Neplatná štruktúra oprávnení, použijem prázdny objekt');
+      rolePermissions = { dashboard: { read: true } };
+    }
+    
+    console.log('[DEBUG] Konečné oprávnenia pre uloženie:', 
+      JSON.stringify(rolePermissions).substring(0, 200) + (JSON.stringify(rolePermissions).length > 200 ? '...' : ''));
+    
+    // Vytvorenie novej role s oprávneniami
+    const newRole = new Role({
+      name,
+      description: description || '',
+      defaultPermissions: rolePermissions,
+      isSystem: false
+    });
+    
+    await newRole.save();
+    
+    console.log(`[DEBUG] Rola ${name} bola úspešne vytvorená s ID ${newRole._id}`);
+    console.log(`[DEBUG] Uložené oprávnenia - hlavné kategórie:`, Object.keys(rolePermissions).join(', '));
+    
+    res.status(201).json({
+      success: true,
+      message: 'Rola bola úspešne vytvorená',
+      role: {
+        id: newRole._id,
+        name: newRole.name,
+        description: newRole.description,
+        permissions: rolePermissions,
+        defaultPermissions: rolePermissions,
+        isSystem: newRole.isSystem
+      }
+    });
+  } catch (error) {
+    logger.error(`Error creating role: ${error.message}`);
+    console.error('[DEBUG] Chyba pri vytváraní role:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri vytváraní role',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Aktualizácia role
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.updateRole = async (req, res) => {
+  try {
+    const { name, description, permissions, defaultPermissions } = req.body;
+    
+    // Logovanie pre debug
+    console.log('[DEBUG] Dáta pre aktualizáciu role:', JSON.stringify({
+      id: req.params.id,
+      name,
+      description,
+      permissionsProvided: !!permissions,
+      defaultPermissionsProvided: !!defaultPermissions
+    }));
+    
+    // Kontrola existencie role
+    const role = await Role.findById(req.params.id);
+    
+    if (!role) {
+      return res.status(404).json({
+        success: false,
+        message: 'Rola nenájdená'
+      });
+    }
+    
+    // Kontrola, či je systémová rola
+    if (role.isSystem) {
+      return res.status(403).json({
+        success: false,
+        message: 'Systémové role nemôžu byť upravované'
+      });
+    }
+    
+    // Kontrola existencie názvu role pri zmene
+    if (name && name !== role.name) {
+      const existingRole = await Role.findOne({
+        _id: { $ne: req.params.id },
+        name
+      });
+      
+      if (existingRole) {
+        return res.status(400).json({
+          success: false,
+          message: 'Rola s týmto názvom už existuje'
+        });
+      }
+    }
+    
+    // Prioritizujeme permissions pred defaultPermissions
+    let rolePermissions = null;
+    if (permissions && typeof permissions === 'object' && !Array.isArray(permissions)) {
+      rolePermissions = JSON.parse(JSON.stringify(permissions)); // Deep copy
+      console.log('[DEBUG] Použité permissions z requestu');
+    } else if (defaultPermissions && typeof defaultPermissions === 'object' && !Array.isArray(defaultPermissions)) {
+      rolePermissions = JSON.parse(JSON.stringify(defaultPermissions)); // Deep copy
+      console.log('[DEBUG] Použité defaultPermissions z requestu');
+    }
+    
+    // Aktualizácia role
+    if (name) role.name = name;
+    if (description !== undefined) role.description = description;
+    if (rolePermissions) {
+      role.defaultPermissions = rolePermissions;
+      console.log('[DEBUG] Aktualizované oprávnenia role');
+    }
+    
+    await role.save();
+    
+    res.status(200).json({
+      success: true,
+      message: 'Rola bola úspešne aktualizovaná',
+      role: {
+        id: role._id,
+        name: role.name,
+        description: role.description,
+        permissions: role.defaultPermissions,
+        defaultPermissions: role.defaultPermissions,
+        isSystem: role.isSystem
+      }
+    });
+  } catch (error) {
+    logger.error(`Error updating role: ${error.message}`);
+    console.error('[DEBUG] Chyba pri aktualizácii role:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri aktualizácii role',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Vymazanie role
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.deleteRole = async (req, res) => {
+  try {
+    const role = await Role.findById(req.params.id);
+    
+    if (!role) {
+      return res.status(404).json({
+        success: false,
+        message: 'Rola nenájdená'
+      });
+    }
+    
+    // Kontrola, či je systémová rola
+    if (role.isSystem) {
+      return res.status(403).json({
+        success: false,
+        message: 'Systémové role nemôžu byť vymazané'
+      });
+    }
+    
+    // Kontrola, či existujú používatelia s touto rolou
+    const usersWithRole = await User.countDocuments({ roleId: role._id });
+    
+    if (usersWithRole > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Túto rolu nie je možné vymazať, pretože ju používajú existujúci používatelia'
+      });
+    }
+    
+    await Role.findByIdAndDelete(req.params.id);
+    
+    res.status(200).json({
+      success: true,
+      message: 'Rola bola úspešne vymazaná'
+    });
+  } catch (error) {
+    logger.error(`Error deleting role: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri vymazávaní role',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Získanie zoznamu všetkých oprávnení
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.getPermissions = async (req, res) => {
+  try {
+    // Definované základné oprávnenia systému
+    const systemPermissions = [
+      { id: 'admin_read', name: 'Čítanie administrácie', category: 'Admin', description: 'Umožňuje prezerať administračné nastavenia' },
+      { id: 'admin_write', name: 'Zápis administrácie', category: 'Admin', description: 'Umožňuje upravovať administračné nastavenia' },
+      { id: 'vyroba_read', name: 'Čítanie výroby', category: 'Výroba', description: 'Umožňuje prezerať výrobné dáta' },
+      { id: 'vyroba_write', name: 'Zápis výroby', category: 'Výroba', description: 'Umožňuje upravovať výrobné dáta' },
+      { id: 'financie_read', name: 'Čítanie financií', category: 'Financie', description: 'Umožňuje prezerať finančné dáta' },
+      { id: 'financie_write', name: 'Zápis financií', category: 'Financie', description: 'Umožňuje upravovať finančné dáta' },
+      { id: 'zakazky_read', name: 'Čítanie zákaziek', category: 'Zákazky', description: 'Umožňuje prezerať zákazky' },
+      { id: 'zakazky_write', name: 'Zápis zákaziek', category: 'Zákazky', description: 'Umožňuje vytvárať a upravovať zákazky' }
+    ];
+    
+    res.status(200).json({
+      success: true,
+      permissions: systemPermissions
+    });
+  } catch (error) {
+    logger.error(`Error getting permissions: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri získavaní oprávnení',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Aktualizácia oprávnení pre rolu
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.updateRolePermissions = async (req, res) => {
+  try {
+    const { defaultPermissions } = req.body;
+    
+    if (!defaultPermissions || typeof defaultPermissions !== 'object') {
+      return res.status(400).json({
+        success: false,
+        message: 'Neplatný formát oprávnení'
+      });
+    }
+    
+    console.log(`[DEBUG] Aktualizácia oprávnení pre rolu s ID: ${req.params.id}`);
+    console.log(`[DEBUG] Prijaté oprávnenia:`, JSON.stringify(defaultPermissions).substring(0, 200));
+    
+    const role = await Role.findById(req.params.id);
+    
+    if (!role) {
+      return res.status(404).json({
+        success: false,
+        message: 'Rola nenájdená'
+      });
+    }
+    
+    // Kontrola, či je systémová rola
+    if (role.isSystem && role.name === 'Administrator') {
+      return res.status(403).json({
+        success: false,
+        message: 'Oprávnenia administrátora nemôžu byť upravované'
+      });
+    }
+    
+    // Uloženie novej verzie oprávnení
+    role.defaultPermissions = defaultPermissions;
+    console.log(`[DEBUG] Ukladám aktualizované oprávnenia pre rolu ${role.name}`);
+    await role.save();
+    
+    res.status(200).json({
+      success: true,
+      message: 'Oprávnenia role boli úspešne aktualizované',
+      role: {
+        id: role._id,
+        name: role.name,
+        defaultPermissions: role.defaultPermissions
+      }
+    });
+  } catch (error) {
+    logger.error(`Error updating role permissions: ${error.message}`);
+    console.error(`[DEBUG] Chyba pri aktualizácii oprávnení pre rolu s ID ${req.params.id}:`, error);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri aktualizácii oprávnení role',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Aktualizácia oprávnení pre používateľa
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.updateUserPermissions = async (req, res) => {
+  try {
+    const { permissions } = req.body;
+    
+    if (!permissions || typeof permissions !== 'object') {
+      return res.status(400).json({
+        success: false,
+        message: 'Neplatný formát oprávnení'
+      });
+    }
+    
+    logger.info(`Aktualizácia oprávnení pre používateľa s ID: ${req.params.id}`);
+    logger.debug(`Prijaté oprávnenia: ${JSON.stringify(permissions).substring(0, 200)}...`);
+    
+    const user = await User.findById(req.params.id);
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Používateľ nenájdený'
+      });
+    }
+    
+    // Uloženie individuálnych oprávnení pre používateľa
+    user.permissions = permissions;
+    logger.info(`Ukladám aktualizované oprávnenia pre používateľa ${user.username}`);
+    await user.save();
+    
+    res.status(200).json({
+      success: true,
+      message: 'Oprávnenia používateľa boli úspešne aktualizované',
+      user: {
+        id: user._id,
+        username: user.username,
+        permissions: user.permissions
+      }
+    });
+  } catch (error) {
+    logger.error(`Error updating user permissions: ${error.message}`);
+    logger.error(`Stack trace: ${error.stack}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri aktualizácii oprávnení používateľa',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Získanie všetkých šablón oprávnení
+ */
+exports.getPermissionTemplates = async (req, res) => {
+  try {
+    console.log("getPermissionTemplates called");
+    
+    // Načítame existujúce šablóny
+    const templates = await PermissionTemplate.find({});
+    
+    console.log('Backend - Found templates count:', templates.length);
+    
+    // Transformujeme šablóny do jednotného formátu a odstránime MongoDB-špecifické polia
+    const formattedTemplates = templates.map(template => {
+      // Odstránime MongoDB špecifické polia a konvertujeme na plain object
+      const plainTemplate = template.toObject ? template.toObject() : { ...template };
+      
+      const result = {
+        id: plainTemplate.id,
+        name: plainTemplate.name,
+        description: plainTemplate.description || '',
+        permissions: plainTemplate.permissions || [],
+        children: Array.isArray(plainTemplate.children) 
+          ? plainTemplate.children.map(child => ({
+              id: child.id,
+              name: child.name,
+              permissions: child.permissions || []
+            }))
+          : []
+      };
+      
+      // Odstránime všetky nepotrebné polia
+      delete result._id;
+      delete result.__v;
+      delete result.createdAt;
+      delete result.updatedAt;
+      
+      return result;
+    });
+    
+    // Pripravíme odpoveď
+    const response = {
+      success: true,
+      templates: formattedTemplates
+    };
+    
+    console.log('Backend - Response structure:', 
+      JSON.stringify(response).substring(0, 100) + '...');
+    
+    // Vrátime odpoveď v očakávanom formáte
+    return res.json(response);
+  } catch (error) {
+    console.error('Backend Error:', error.message);
+    logger.error(`Error getting permission templates: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'Chyba pri získavaní šablón oprávnení',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Získanie systémových nastavení
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.getSystemSettings = async (req, res) => {
+  try {
+    // Získanie systémových nastavení z kolekcie settings
+    const db = req.app.locals.db;
+    const settingsCollection = db.collection('settings');
+    
+    // Hľadáme globálne nastavenia alebo vytvárame nové, ak neexistujú
+    let settings = await settingsCollection.findOne({ type: 'global' });
+    
+    if (!settings) {
+      // Ak nastavenia neexistujú, vytvoríme predvolené hodnoty
+      const defaultSettings = {
+        type: 'global',
+        system: {
+          appName: 'ADSUN 2.0',
+          logoUrl: '/assets/images/logo.png',
+          companyName: 'ADsun, s.r.o.',
+          maintenanceMode: false,
+          debugMode: false
+        },
+        email: {
+          smtpServer: 'smtp.example.com',
+          smtpPort: 587,
+          smtpUser: 'noreply@example.com',
+          notificationEmail: 'admin@example.com',
+          enableNotifications: true
+        },
+        security: {
+          sessionTimeout: 30,
+          maxLoginAttempts: 5,
+          passwordExpiration: 90,
+          requireStrongPasswords: true,
+          enableTwoFactor: false
+        },
+        performance: {
+          cacheEnabled: true,
+          logLevel: 'warning',
+          itemsPerPage: 15
+        },
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+      
+      // Vložíme predvolené nastavenia do databázy
+      await settingsCollection.insertOne(defaultSettings);
+      settings = defaultSettings;
+    }
+    
+    // Odstránime technické polia pred odoslaním klientovi
+    delete settings._id;
+    
+    return res.status(200).json({
+      success: true,
+      settings: settings
+    });
+  } catch (error) {
+    logger.error(`Error getting system settings: ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      message: 'Chyba pri získavaní systémových nastavení',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Aktualizácia systémových nastavení
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+exports.updateSystemSettings = async (req, res) => {
+  try {
+    // Validácia vstupu
+    if (!req.body || typeof req.body !== 'object') {
+      return res.status(400).json({
+        success: false,
+        message: 'Neplatný formát dát'
+      });
+    }
+    
+    const { system, email, security, performance } = req.body;
+    
+    const db = req.app.locals.db;
+    const settingsCollection = db.collection('settings');
+    
+    // Aktualizácia nastavení v databáze
+    const updateResult = await settingsCollection.updateOne(
+      { type: 'global' },
+      { 
+        $set: {
+          system: system || {},
+          email: email || {},
+          security: security || {},
+          performance: performance || {},
+          updatedAt: new Date()
+        } 
+      },
+      { upsert: true }
+    );
+    
+    if (updateResult.matchedCount === 0 && updateResult.upsertedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Nastavenia neboli nájdené a nebolo možné ich vytvoriť'
+      });
+    }
+    
+    logger.info(`System settings updated by user ${req.user.username} (${req.user._id})`);
+    
+    return res.status(200).json({
+      success: true,
+      message: 'Systémové nastavenia boli úspešne aktualizované'
+    });
+  } catch (error) {
+    logger.error(`Error updating system settings: ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      message: 'Chyba pri aktualizácii systémových nastavení',
+      error: error.message
+    });
+  }
+}; 
